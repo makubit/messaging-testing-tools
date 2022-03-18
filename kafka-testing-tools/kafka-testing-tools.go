@@ -15,13 +15,6 @@ import (
 	"github.com/rcrowley/go-metrics"
 )
 
-//testing
-//consumerOnly
-//producerOnly
-//endToEnd
-//multipleConsumers
-//multipleProducers
-
 var (
 	testVariant  = flag.String("test-type", "end-to-end", "performace test type, available: end-to-end, producer-only, consumer-only, producer-multiple, consumer-multiple\nnote: consumer-only and consumer-multiple requires pre-generated messages")
 	messageLoad  = flag.Int("message-load", 0, "number of messages that will be produced")
@@ -36,7 +29,7 @@ var (
 
 const (
 	endToEnd         string = "end-to-end"
-	producerOnly            = "producer-only"
+	producerOnly            = string("producer-only")
 	producerMultiple        = "producer-multiple"
 	consumerOnly            = "consumer-only"
 	consumerMultiple        = "consumer-multiple"
@@ -53,6 +46,7 @@ type measurements struct {
 	lock            sync.Mutex
 	index           int64
 	msgPerSec       float64
+	registry        *metrics.Registry
 }
 
 func parseTestType() {
@@ -82,7 +76,8 @@ func main() {
 
 	//prepare measurements for consumer
 	m := &measurements{
-		consumerLatency: make([]int64, *messageLoad),
+		consumerLatency: make([]int64, *messageLoad**consumerLoad),
+		registry:        &config.MetricRegistry,
 		index:           0,
 		msgPerSec:       0,
 	}
@@ -106,7 +101,7 @@ func main() {
 		for {
 			select {
 			case <-t:
-				printMetricsProducer(config.MetricRegistry)
+				m.printMetricsProducer(*testVariant)
 			case <-ctx.Done():
 				return
 			}
@@ -135,18 +130,21 @@ func main() {
 		}
 		t.wg.Wait()
 	case consumerOnly:
-		t.runConsumer(cli, *topic, *partition, *messageLoad, sarama.OffsetOldest, m)
+		t.runConsumer(cli, *topic, *partition, *messageLoad, sarama.OffsetOldest, m, *testVariant)
 	case consumerMultiple:
-		fmt.Println("not yet implemented")
-		return
+		for i := 0; i < *consumerLoad; i++ {
+			t.wg.Add(1)
+			go t.runConsumer(cli, *topic, *partition, *messageLoad, sarama.OffsetOldest, m, *testVariant)
+		}
+		t.wg.Wait()
 	}
 
 	cancel()
 	<-timer
 	close(t.completed)
 
-	printMetricsProducer(config.MetricRegistry)
-	m.printMetricsConsumer(config.MetricRegistry)
+	m.printMetricsProducer(*testVariant)
+	m.printMetricsConsumer(*testVariant)
 }
 
 func (t *asyncTesting) runProducer(topic string, partition, messageLoad, messageSize int, config *sarama.Config, brokers []string, throughput int, testVariant string) {
@@ -191,7 +189,12 @@ func (t *asyncTesting) runProducer(topic string, partition, messageLoad, message
 	<-t.completed
 }
 
-func (t *asyncTesting) runConsumer(cli sarama.Client, topic string, partition, messageLoad int, offset int64, m *measurements) {
+func (t *asyncTesting) runConsumer(cli sarama.Client, topic string, partition, messageLoad int, offset int64, m *measurements, testVariant string) {
+	//inform that goroutine finished only in multiple mode
+	if testVariant == consumerMultiple || testVariant == endToEndMultiple {
+		defer t.wg.Done()
+	}
+
 	consumer, err := sarama.NewConsumerFromClient(cli)
 	if err != nil {
 		printErrAndExit(err)
@@ -208,16 +211,16 @@ func (t *asyncTesting) runConsumer(cli sarama.Client, topic string, partition, m
 	for i := 0; i < messageLoad; i++ {
 		t1 := time.Now().UnixNano() / int64(time.Nanosecond)
 		<-p.Messages()
-		//time.Sleep(1 * time.Second)
 		t2 := time.Now().UnixNano() / int64(time.Nanosecond)
 		m.lock.Lock()
-		m.consumerLatency[m.index] = t2 - t1 //t2.Sub(t1).Microseconds()
-		//fmt.Printf("latency: %d, %d, %d\n", t1, t2, m.consumerLatency[m.index])
+		m.consumerLatency[m.index] = t2 - t1
 		m.index++
 		m.lock.Unlock()
 	}
 	tMsg2 := float64(time.Now().UnixNano()) / float64(time.Second)
-	m.msgPerSec = float64(m.index) / (tMsg2 - tMsg1)
+	m.lock.Lock()
+	m.msgPerSec = (m.msgPerSec + float64(m.index)/(tMsg2-tMsg1)) / 2
+	m.lock.Unlock()
 }
 
 func generateRandomMessages(topic string, partition, messageLoad, messageSize int) ([]*sarama.ProducerMessage, error) {
@@ -241,7 +244,8 @@ func printErrAndExit(err error) {
 	os.Exit(1)
 }
 
-func printMetricsProducer(r metrics.Registry) {
+func (m *measurements) printMetricsProducer(testVariant string) {
+	r := *m.registry
 	recordSendRateMetric := r.Get("record-send-rate")
 	requestLatencyMetric := r.Get("request-latency-in-ms")
 	outgoingByteRateMetric := r.Get("outgoing-byte-rate")
@@ -251,6 +255,11 @@ func printMetricsProducer(r metrics.Registry) {
 		requestsInFlightMetric == nil {
 		return
 	}
+	allowedModes := []string{producerOnly, producerMultiple, endToEnd, endToEndMultiple}
+	if !modeInSlice(testVariant, allowedModes) {
+		return
+	}
+
 	recordSendRate := recordSendRateMetric.(metrics.Meter).Snapshot()
 	requestLatency := requestLatencyMetric.(metrics.Histogram).Snapshot()
 	requestLatencyPercentiles := requestLatency.Percentiles([]float64{0.5, 0.75, 0.95, 0.99, 0.999})
@@ -275,8 +284,15 @@ func printMetricsProducer(r metrics.Registry) {
 	fmt.Fprintf(os.Stdout, "number of concurrent producers: %d\n", *producerLoad)
 }
 
-func (m *measurements) printMetricsConsumer(r metrics.Registry) {
+func (m *measurements) printMetricsConsumer(testVariant string) {
+	r := *m.registry
 	incomingByteRateMetric := r.Get("incoming-byte-rate")
+
+	allowedModes := []string{consumerOnly, consumerMultiple, endToEnd, endToEndMultiple}
+	if !modeInSlice(testVariant, allowedModes) {
+		return
+	}
+
 	var avgLatency int64 = 0
 	for i := 0; i < len(m.consumerLatency); i++ {
 		avgLatency += m.consumerLatency[i]
@@ -284,7 +300,7 @@ func (m *measurements) printMetricsConsumer(r metrics.Registry) {
 	avgLatency = avgLatency / int64(len(m.consumerLatency))
 	incomingByteRate := incomingByteRateMetric.(metrics.Meter).Snapshot()
 
-	fmt.Fprintf(os.Stdout, "%d records sent, %.1f records/sec (%.2f MiB/sec ingress, %.2f MiB/sec egress), %f ms avg latency\n",
+	fmt.Fprintf(os.Stdout, "%d records received, %.1f records/sec (%.2f MiB/sec ingress, %.2f MiB/sec egress), %f ms avg latency\n",
 		m.index,
 		m.msgPerSec,
 		m.msgPerSec*float64(*messageSize)/1024/1024,
@@ -292,4 +308,13 @@ func (m *measurements) printMetricsConsumer(r metrics.Registry) {
 		float64(avgLatency)/float64(time.Millisecond),
 	)
 	fmt.Fprintf(os.Stdout, "number of concurrent consumers: %d\n", *consumerLoad)
+}
+
+func modeInSlice(a string, list []string) bool {
+	for _, b := range list {
+		if b == a {
+			return true
+		}
+	}
+	return false
 }
