@@ -7,12 +7,10 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"sync"
 	gosync "sync"
 	"time"
 
 	"github.com/Shopify/sarama"
-	"github.com/rcrowley/go-metrics"
 )
 
 var (
@@ -25,6 +23,7 @@ var (
 	partition    = flag.Int("partition", 0, "partition of topic to run performance tests on")
 	producerLoad = flag.Int("producer-load", 1, "number of concurrent producers")
 	consumerLoad = flag.Int("consumer-load", 1, "number of concurrent consumers")
+	endToEndLoad = flag.Int("end-to-end-load", 1, "number of concurrent producers and consumers")
 )
 
 const (
@@ -37,16 +36,7 @@ const (
 )
 
 type asyncTesting struct {
-	completed chan int
-	wg        gosync.WaitGroup
-}
-
-type measurements struct {
-	consumerLatency []int64
-	lock            sync.Mutex
-	index           int64
-	msgPerSec       float64
-	registry        *metrics.Registry
+	wg gosync.WaitGroup
 }
 
 func parseTestType() {
@@ -75,8 +65,14 @@ func main() {
 	config.Producer.Return.Successes = true
 
 	//prepare measurements for consumer
-	m := &measurements{
-		consumerLatency: make([]int64, *messageLoad**consumerLoad),
+	var load int = 0
+	if *testVariant == endToEndMultiple {
+		load = *endToEndLoad
+	} else {
+		load = *consumerLoad
+	}
+	m := &Measurements{
+		consumerLatency: make([]int64, *messageLoad*load),
 		registry:        &config.MetricRegistry,
 		index:           0,
 		msgPerSec:       0,
@@ -111,16 +107,21 @@ func main() {
 	brokers := strings.Split(*brokers, ",")
 
 	//run test type
-	t := &asyncTesting{
-		completed: make(chan int),
-	}
+	t := &asyncTesting{}
+
 	switch *testVariant {
 	case endToEnd:
-		fmt.Println("not yet implemented")
-		return
+		t.wg.Add(2)
+		go t.runConsumer(cli, *topic, *partition, *messageLoad, sarama.OffsetNewest, m, *testVariant)
+		go t.runProducer(*topic, *partition, *messageLoad, *messageSize, config, brokers, *throughput, *testVariant)
+		t.wg.Wait()
 	case endToEndMultiple:
-		fmt.Println("not yet implemented")
-		return
+		for i := 0; i < *endToEndLoad; i++ {
+			t.wg.Add(2)
+			go t.runConsumer(cli, *topic, *partition, *messageLoad, sarama.OffsetOldest, m, *testVariant)
+			go t.runProducer(*topic, *partition, *messageLoad, *messageSize, config, brokers, *throughput, *testVariant)
+		}
+		t.wg.Wait()
 	case producerOnly:
 		t.runProducer(*topic, *partition, *messageLoad, *messageSize, config, brokers, *throughput, *testVariant)
 	case producerMultiple:
@@ -141,7 +142,6 @@ func main() {
 
 	cancel()
 	<-timer
-	close(t.completed)
 
 	m.printMetricsProducer(*testVariant)
 	m.printMetricsConsumer(*testVariant)
@@ -149,7 +149,7 @@ func main() {
 
 func (t *asyncTesting) runProducer(topic string, partition, messageLoad, messageSize int, config *sarama.Config, brokers []string, throughput int, testVariant string) {
 	//inform that goroutine finished only in multiple mode
-	if testVariant == producerMultiple || testVariant == endToEndMultiple {
+	if testVariant == producerMultiple || testVariant == endToEnd || testVariant == endToEndMultiple {
 		defer t.wg.Done()
 	}
 
@@ -169,6 +169,7 @@ func (t *asyncTesting) runProducer(topic string, partition, messageLoad, message
 	if err != nil {
 		printErrAndExit(err)
 	}
+	completed := make(chan int)
 
 	go func() {
 		for i := 0; i < messageLoad; i++ {
@@ -176,22 +177,23 @@ func (t *asyncTesting) runProducer(topic string, partition, messageLoad, message
 			case <-producer.Successes():
 				//actually not necessary
 			case err := <-producer.Errors():
-				fmt.Println("4")
+				fmt.Println("error on receiving success from producer")
 				printErrAndExit(err)
 			}
 		}
-		t.completed <- messageLoad
+		completed <- messageLoad
 	}()
 
 	for _, message := range messages {
 		producer.Input() <- message
 	}
-	<-t.completed
+	<-completed
+	close(completed)
 }
 
-func (t *asyncTesting) runConsumer(cli sarama.Client, topic string, partition, messageLoad int, offset int64, m *measurements, testVariant string) {
+func (t *asyncTesting) runConsumer(cli sarama.Client, topic string, partition, messageLoad int, offset int64, m *Measurements, testVariant string) {
 	//inform that goroutine finished only in multiple mode
-	if testVariant == consumerMultiple || testVariant == endToEndMultiple {
+	if testVariant == consumerMultiple || testVariant == endToEnd || testVariant == endToEndMultiple {
 		defer t.wg.Done()
 	}
 
@@ -242,79 +244,4 @@ func generateRandomMessages(topic string, partition, messageLoad, messageSize in
 func printErrAndExit(err error) {
 	fmt.Fprintf(os.Stderr, "error: %s\n", err)
 	os.Exit(1)
-}
-
-func (m *measurements) printMetricsProducer(testVariant string) {
-	r := *m.registry
-	recordSendRateMetric := r.Get("record-send-rate")
-	requestLatencyMetric := r.Get("request-latency-in-ms")
-	outgoingByteRateMetric := r.Get("outgoing-byte-rate")
-	requestsInFlightMetric := r.Get("requests-in-flight")
-
-	if recordSendRateMetric == nil || requestLatencyMetric == nil || outgoingByteRateMetric == nil ||
-		requestsInFlightMetric == nil {
-		return
-	}
-	allowedModes := []string{producerOnly, producerMultiple, endToEnd, endToEndMultiple}
-	if !modeInSlice(testVariant, allowedModes) {
-		return
-	}
-
-	recordSendRate := recordSendRateMetric.(metrics.Meter).Snapshot()
-	requestLatency := requestLatencyMetric.(metrics.Histogram).Snapshot()
-	requestLatencyPercentiles := requestLatency.Percentiles([]float64{0.5, 0.75, 0.95, 0.99, 0.999})
-	outgoingByteRate := outgoingByteRateMetric.(metrics.Meter).Snapshot()
-	requestsInFlight := requestsInFlightMetric.(metrics.Counter).Count()
-	fmt.Fprintf(os.Stdout, "%d records sent, %.1f records/sec (%.2f MiB/sec ingress, %.2f MiB/sec egress), "+
-		"%.1f ms avg latency, %.1f ms stddev, %.1f ms 50th, %.1f ms 75th, "+
-		"%.1f ms 95th, %.1f ms 99th, %.1f ms 99.9th, %d total req. in flight\n",
-		recordSendRate.Count(),
-		recordSendRate.RateMean(),
-		recordSendRate.RateMean()*float64(*messageSize)/1024/1024,
-		outgoingByteRate.RateMean()/1024/1024,
-		requestLatency.Mean(),
-		requestLatency.StdDev(),
-		requestLatencyPercentiles[0],
-		requestLatencyPercentiles[1],
-		requestLatencyPercentiles[2],
-		requestLatencyPercentiles[3],
-		requestLatencyPercentiles[4],
-		requestsInFlight,
-	)
-	fmt.Fprintf(os.Stdout, "number of concurrent producers: %d\n", *producerLoad)
-}
-
-func (m *measurements) printMetricsConsumer(testVariant string) {
-	r := *m.registry
-	incomingByteRateMetric := r.Get("incoming-byte-rate")
-
-	allowedModes := []string{consumerOnly, consumerMultiple, endToEnd, endToEndMultiple}
-	if !modeInSlice(testVariant, allowedModes) {
-		return
-	}
-
-	var avgLatency int64 = 0
-	for i := 0; i < len(m.consumerLatency); i++ {
-		avgLatency += m.consumerLatency[i]
-	}
-	avgLatency = avgLatency / int64(len(m.consumerLatency))
-	incomingByteRate := incomingByteRateMetric.(metrics.Meter).Snapshot()
-
-	fmt.Fprintf(os.Stdout, "%d records received, %.1f records/sec (%.2f MiB/sec ingress, %.2f MiB/sec egress), %f ms avg latency\n",
-		m.index,
-		m.msgPerSec,
-		m.msgPerSec*float64(*messageSize)/1024/1024,
-		incomingByteRate.RateMean()/1024/1024,
-		float64(avgLatency)/float64(time.Millisecond),
-	)
-	fmt.Fprintf(os.Stdout, "number of concurrent consumers: %d\n", *consumerLoad)
-}
-
-func modeInSlice(a string, list []string) bool {
-	for _, b := range list {
-		if b == a {
-			return true
-		}
-	}
-	return false
 }
