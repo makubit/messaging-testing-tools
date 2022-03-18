@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	gosync "sync"
 	"time"
 
@@ -22,13 +23,13 @@ import (
 //multipleProducers
 
 var (
-	testVariant  = flag.String("test-type", "end-to-end", "performace test type, available: end-to-end, producer-only, consumer-only, producer-multiple, consumer-multiple")
+	testVariant  = flag.String("test-type", "end-to-end", "performace test type, available: end-to-end, producer-only, consumer-only, producer-multiple, consumer-multiple\nnote: consumer-only and consumer-multiple requires pre-generated messages")
 	messageLoad  = flag.Int("message-load", 0, "number of messages that will be produced")
 	messageSize  = flag.Int("message-size", 0, "approximate message size in bytes that will be produced")
 	brokers      = flag.String("brokers", "my-kafka-0.my-kafka-headless.default.svc.cluster.local:9092,my-kafka-1.my-kafka-headless.default.svc.cluster.local:9092,my-kafka-2.my-kafka-headless.default.svc.cluster.local:9092", "list of brokers")
 	topic        = flag.String("topic", "my-kafka", "kafka topic name")
 	throughput   = flag.Int("throughput", -1, "maximum messages sent per second")
-	partition    = flag.Int("partition", -1, "partition of topic to run performance tests on")
+	partition    = flag.Int("partition", 0, "partition of topic to run performance tests on")
 	producerLoad = flag.Int("producer-load", 1, "number of concurrent producers")
 	consumerLoad = flag.Int("consumer-load", 1, "number of concurrent consumers")
 )
@@ -45,6 +46,13 @@ const (
 type asyncTesting struct {
 	completed chan int
 	wg        gosync.WaitGroup
+}
+
+type measurements struct {
+	consumerLatency []int64
+	lock            sync.Mutex
+	index           int64
+	msgPerSec       float64
 }
 
 func parseTestType() {
@@ -71,6 +79,13 @@ func main() {
 	config := sarama.NewConfig()
 	config.ClientID = "testClientID"
 	config.Producer.Return.Successes = true
+
+	//prepare measurements for consumer
+	m := &measurements{
+		consumerLatency: make([]int64, *messageLoad),
+		index:           0,
+		msgPerSec:       0,
+	}
 
 	cli, err := sarama.NewClient([]string{*brokers}, config)
 	if err != nil {
@@ -120,8 +135,7 @@ func main() {
 		}
 		t.wg.Wait()
 	case consumerOnly:
-		fmt.Println("not yet implemented")
-		return
+		t.runConsumer(cli, *topic, *partition, *messageLoad, sarama.OffsetOldest, m)
 	case consumerMultiple:
 		fmt.Println("not yet implemented")
 		return
@@ -129,11 +143,19 @@ func main() {
 
 	cancel()
 	<-timer
+	close(t.completed)
 
 	printMetricsProducer(config.MetricRegistry)
+	m.printMetricsConsumer(config.MetricRegistry)
 }
 
 func (t *asyncTesting) runProducer(topic string, partition, messageLoad, messageSize int, config *sarama.Config, brokers []string, throughput int, testVariant string) {
+	//inform that goroutine finished only in multiple mode
+	if testVariant == producerMultiple || testVariant == endToEndMultiple {
+		defer t.wg.Done()
+	}
+
+	//create async producer
 	producer, err := sarama.NewAsyncProducer(brokers, config)
 	if err != nil {
 		printErrAndExit(err)
@@ -144,6 +166,7 @@ func (t *asyncTesting) runProducer(topic string, partition, messageLoad, message
 		}
 	}()
 
+	//generate messages
 	messages, err := generateRandomMessages(topic, partition, messageLoad, messageSize)
 	if err != nil {
 		printErrAndExit(err)
@@ -166,15 +189,36 @@ func (t *asyncTesting) runProducer(topic string, partition, messageLoad, message
 		producer.Input() <- message
 	}
 	<-t.completed
-	close(t.completed)
-
-	//inform that goroutine finished only in multiple mode
-	if testVariant == producerMultiple || testVariant == endToEndMultiple {
-		t.wg.Done()
-	}
 }
 
-func runConsumer() {}
+func (t *asyncTesting) runConsumer(cli sarama.Client, topic string, partition, messageLoad int, offset int64, m *measurements) {
+	consumer, err := sarama.NewConsumerFromClient(cli)
+	if err != nil {
+		printErrAndExit(err)
+	}
+	//range partitions if we have more partitions
+	p, err := consumer.ConsumePartition(topic, int32(partition), offset)
+	if err != nil {
+		printErrAndExit(fmt.Errorf("error subscribing to partition: %w", err))
+	}
+	defer p.Close()
+	tMsg1 := float64(time.Now().UnixNano()) / float64(time.Second)
+
+	//receive messages
+	for i := 0; i < messageLoad; i++ {
+		t1 := time.Now().UnixNano() / int64(time.Nanosecond)
+		<-p.Messages()
+		//time.Sleep(1 * time.Second)
+		t2 := time.Now().UnixNano() / int64(time.Nanosecond)
+		m.lock.Lock()
+		m.consumerLatency[m.index] = t2 - t1 //t2.Sub(t1).Microseconds()
+		//fmt.Printf("latency: %d, %d, %d\n", t1, t2, m.consumerLatency[m.index])
+		m.index++
+		m.lock.Unlock()
+	}
+	tMsg2 := float64(time.Now().UnixNano()) / float64(time.Second)
+	m.msgPerSec = float64(m.index) / (tMsg2 - tMsg1)
+}
 
 func generateRandomMessages(topic string, partition, messageLoad, messageSize int) ([]*sarama.ProducerMessage, error) {
 	messages := make([]*sarama.ProducerMessage, messageLoad)
@@ -229,4 +273,23 @@ func printMetricsProducer(r metrics.Registry) {
 		requestsInFlight,
 	)
 	fmt.Fprintf(os.Stdout, "number of concurrent producers: %d\n", *producerLoad)
+}
+
+func (m *measurements) printMetricsConsumer(r metrics.Registry) {
+	incomingByteRateMetric := r.Get("incoming-byte-rate")
+	var avgLatency int64 = 0
+	for i := 0; i < len(m.consumerLatency); i++ {
+		avgLatency += m.consumerLatency[i]
+	}
+	avgLatency = avgLatency / int64(len(m.consumerLatency))
+	incomingByteRate := incomingByteRateMetric.(metrics.Meter).Snapshot()
+
+	fmt.Fprintf(os.Stdout, "%d records sent, %.1f records/sec (%.2f MiB/sec ingress, %.2f MiB/sec egress), %f ms avg latency\n",
+		m.index,
+		m.msgPerSec,
+		m.msgPerSec*float64(*messageSize)/1024/1024,
+		incomingByteRate.RateMean()/1024/1024,
+		float64(avgLatency)/float64(time.Millisecond),
+	)
+	fmt.Fprintf(os.Stdout, "number of concurrent consumers: %d\n", *consumerLoad)
 }

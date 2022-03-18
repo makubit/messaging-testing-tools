@@ -8,15 +8,6 @@ import (
 
 //Stats are statistics used for analysis of performance
 type Stats struct {
-	// 	lock sync.Mutex
-
-	// 	units   string           // the units of the measurement (used for pretty printing)
-	// 	binsize float64          // size of the bins used for accumulating counts
-	// 	counts  map[int64]uint64 // maps bin number to the count of how many x values fell into that bin
-
-	// 	n        int     // # of times x was accumulated
-	// 	sum      float64 // sum of all x
-	// 	min, max float64
 	start              int64
 	windowStart        int64
 	latencies          []int
