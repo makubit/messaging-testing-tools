@@ -117,8 +117,11 @@ func main() {
 		t.wg.Wait()
 	case endToEndMultiple:
 		for i := 0; i < *endToEndLoad; i++ {
-			t.wg.Add(2)
-			go t.runConsumer(cli, *topic, *partition, *messageLoad, sarama.OffsetOldest, m, *testVariant)
+			t.wg.Add(1)
+			go t.runConsumer(cli, *topic, *partition, *messageLoad, sarama.OffsetNewest, m, *testVariant)
+		}
+		for i := 0; i < *endToEndLoad; i++ {
+			t.wg.Add(1)
 			go t.runProducer(*topic, *partition, *messageLoad, *messageSize, config, brokers, *throughput, *testVariant)
 		}
 		t.wg.Wait()
