@@ -24,6 +24,9 @@ var (
 	producerLoad = flag.Int("producer-load", 1, "number of concurrent producers")
 	consumerLoad = flag.Int("consumer-load", 1, "number of concurrent consumers")
 	endToEndLoad = flag.Int("end-to-end-load", 1, "number of concurrent producers and consumers")
+	maxBatchSize = flag.Int("max-batch-size", 1, "max number of messages that will be polled")
+	requiredAcks = flag.Int("required-acks", 1, "required number of acks needed from the broker (-1: all, 0: none, 1: local).")
+	timeout      = flag.Duration("timeout", 10*time.Second, "duration the producer will wait to receive required acks.")
 )
 
 const (
@@ -63,6 +66,10 @@ func main() {
 	config := sarama.NewConfig()
 	config.ClientID = "testClientID"
 	config.Producer.Return.Successes = true
+	config.Consumer.Fetch.Max = int32(*maxBatchSize * *messageSize)
+	config.Producer.RequiredAcks = sarama.RequiredAcks(*requiredAcks)
+	config.Producer.Timeout = *timeout
+	//testing flush?
 
 	//prepare measurements for consumer
 	var load int = 0
@@ -223,9 +230,16 @@ func (t *asyncTesting) runConsumer(cli sarama.Client, topic string, partition, m
 		m.lock.Unlock()
 	}
 	tMsg2 := float64(time.Now().UnixNano()) / float64(time.Second)
-	m.lock.Lock()
-	m.msgPerSec = (m.msgPerSec + float64(m.index)/(tMsg2-tMsg1)) / 2
-	m.lock.Unlock()
+	if m.msgPerSec != 0 {
+		m.lock.Lock()
+		m.msgPerSec = (m.msgPerSec + float64(messageLoad)/(tMsg2-tMsg1)) / 2
+		m.lock.Unlock()
+	} else {
+		m.lock.Lock()
+		m.msgPerSec = float64(messageLoad) / (tMsg2 - tMsg1)
+		m.lock.Unlock()
+	}
+
 }
 
 func generateRandomMessages(topic string, partition, messageLoad, messageSize int) ([]*sarama.ProducerMessage, error) {

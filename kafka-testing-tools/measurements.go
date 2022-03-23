@@ -78,10 +78,10 @@ func (m *Measurements) printMetricsConsumer(testVariant string) {
 	avgLatency = avgLatency / int64(len(m.consumerLatency))
 	incomingByteRate := incomingByteRateMetric.(metrics.Meter).Snapshot()
 
-	fmt.Fprintf(os.Stdout, "%d records received, %.1f records/sec (%.2f MiB/sec ingress, %.2f MiB/sec egress), %f ms avg latency\n",
+	fmt.Fprintf(os.Stdout, "%d records received, %.1f records/sec (%.2f MiB/sec ingress), %f ms avg latency\n",
 		m.index,
 		m.msgPerSec,
-		m.msgPerSec*float64(*messageSize)/1024/1024,
+		// m.msgPerSec*float64(*messageSize)/1024/1024,
 		incomingByteRate.RateMean()/1024/1024,
 		float64(avgLatency)/float64(time.Millisecond),
 	)
